@@ -1,0 +1,12 @@
+# GonkaAPI farm — tidak butuh dependency eksternal sama sekali.
+# Murni memakai Python standard library (urllib, argparse, json, ...).
+#
+# Install (di venv apa pun):
+#   python -m venv venv
+#   source venv/bin/activate        # macOS/Linux
+#   venv\Scripts\activate           # Windows
+#   pip install -r requirements.txt
+#
+# Jika di sistem memakai Python 3.9+ sudah cukup. Tidak ada paket pihak
+# ketiga yang wajib; baris di bawah hanya placeholder untuk konsistensi
+# bila nanti ingin menambah library (mis. requests).
