@@ -22,13 +22,16 @@ Inbox temp: GrabMail (grabmail.io) — domain LOLOS blacklist, gratis, API tan p
 
 Pakai
 -----
-  python gonka_farm.py 5            # 5 akun
+  python gonka_farm.py 5            # 5 akun (mode kompat lama, direct)
   python gonka_farm.py 5 -w 3       # 5 akun, 3 worker paralel
   python gonka_farm.py 5 --sleep 10 # jeda antar akun 10s
-  python gonka_farm.py 5 --proxy "user:pass@host:port"   # 1 proxy (BrightData, dll)
-  python gonka_farm.py 5 --proxy "127.0.0.1:8080"        # proxy lokal tanpa auth
+  python gonka_farm.py 5 --proxy "user:pass@host:port"   # 1 proxy
   python gonka_farm.py 5 --proxy-file proxies.txt        # banyak proxy round-robin
-  python gonka_farm.py --check      # cek config + akses Supabase
+
+  # Mode GACHA (meniru dahl-farm): proxy ACAK per akun + reroll otomatis saat 23514/429
+  python gonka_farm.py gacha 10 --proxy-file proxies_good.txt --max-roll 30
+  python gonka_farm.py gacha 10 --proxy "b1:c1@ip1:port b2:c2@ip2:port"   # (pisah spasi tak didukung; pakai file)
+  python gonka_farm.py gacha 10 --proxy-file proxies.txt --sleep 5
 
 contoh proxies.txt (1 per baris):
   user:pass@host1:port
@@ -111,11 +114,20 @@ def _next_proxy():
         _PROXY_RR += 1
     return p
 
+# proxy yang "dipaksa" utk thread ini (dipakai mode gacha), bukan round-robin
+_FORCED_PROXY = threading.local()
+
+def _set_forced_proxy(spec):
+    """Sematkan proxy utk thread ini (dipakai gacha). None = lepas (kembali round-robin)."""
+    _FORCED_PROXY.spec = spec
+
 def proxy_for_thread():
-    """Ambil/set proxy untuk thread (round-robin; satu proxy per thread)."""
+    """Ambil/set proxy untuk thread: forced (gacha) dulu, lalu round-robin."""
     if getattr(_PROXY_STATE, "opener", None) is not None:
         return _PROXY_STATE.opener
-    px = _next_proxy()
+    px = getattr(_FORCED_PROXY, "spec", None)
+    if px is None:
+        px = _next_proxy()
     _PROXY_STATE.opener = _proxy_opener(px)
     _PROXY_STATE.spec = px
     return _PROXY_STATE.opener
@@ -222,6 +234,13 @@ def newpass():
     return "Gn" + "".join(random.choices(string.ascii_letters + string.digits, k=10)) + "!x9"
 
 
+def _fail(rec, idx, msg):
+    """Mencatat gagal + mencetak ke konsol (biar terlihat di mode batch)."""
+    rec["error"] = msg
+    print(f"  [{idx}] ✖ {msg[:120]}", flush=True)
+    return rec
+
+
 def farm_one(idx):
     # reset proxy thread-local agar tiap akun dapat proxy baru (rotasi round-robin)
     _PROXY_STATE.opener = None
@@ -237,10 +256,11 @@ def farm_one(idx):
         pwd = newpass()
 
         # 2) validasi (sanity)
-        v = verify_email(addr)
+        st_v, v = http("POST", f"{FUNCTIONS_URL}/validate-email",
+                       {"email": addr},
+                       {"Authorization": f"Bearer {anon_key()}", "apikey": anon_key()})
         if not (isinstance(v, dict) and v.get("ok")):
-            rec["error"] = f"email ditolak: {v}"
-            return rec
+            return _fail(rec, idx, f"email ditolak (HTTP {st_v}): {str(v)[:80]}")
 
         # 3) signup dengan ref_code
         s, j = http("POST", f"{AUTH_URL}/signup",
@@ -248,16 +268,14 @@ def farm_one(idx):
                      "data": {"ref_code": REF_CODE}},
                     {"apikey": anon_key(), "Authorization": f"Bearer {anon_key()}"})
         if s not in (200, 201) or not isinstance(j, dict) or "id" not in j:
-            rec["error"] = f"signup {s}: {str(j)[:160]}"
-            return rec
+            return _fail(rec, idx, f"signup {s}: {str(j)[:160]}")
         user_id = j.get("id")
         print(f"  [{idx}] akun dibuat ({user_id[:8]}), tunggu email konfirmasi...", flush=True)
 
         # 4) baca link konfirmasi
         link = poll_confirm_link(addr, 240)
         if not link:
-            rec["error"] = "tidak dapat link konfirmasi (timeout)"
-            return rec
+            return _fail(rec, idx, "tidak dapat link konfirmasi (timeout)")
         print(f"  [{idx}] link konfirmasi diterima", flush=True)
 
         # 5) buka link verifikasi — Supabase menerima GET dengan token di query
@@ -267,8 +285,7 @@ def farm_one(idx):
             v_url = f"{link}{sep}apikey={anon_key()}"
         s2, _ = http("GET", v_url, headers={"apikey": anon_key(), "Authorization": f"Bearer {anon_key()}"})
         if s2 not in (200, 301, 302):
-            rec["error"] = f"verifikasi HTTP {s2}"
-            return rec
+            return _fail(rec, idx, f"verifikasi HTTP {s2}")
         print(f"  [{idx}] terverifikasi (HTTP {s2})", flush=True)
 
         # 6) login -> JWT (JSON body di URL ?grant_type=password — sudah teruji)
@@ -288,8 +305,7 @@ def farm_one(idx):
             except Exception:
                 t = {}
         if not isinstance(t, dict) or "access_token" not in t:
-            rec["error"] = f"login: {str(t)[:160]}"
-            return rec
+            return _fail(rec, idx, f"login: {str(t)[:160]}")
         jwt = t["access_token"]
         print(f"  [{idx}] login ok (JWT {len(jwt)} char)", flush=True)
 
@@ -313,8 +329,7 @@ def farm_one(idx):
             if isinstance(g, list) and g:
                 key = g[0].get("key")
         if not key:
-            rec["error"] = f"key tidak didapat (insert {s4}: {str(k)[:120]})"
-            return rec
+            return _fail(rec, idx, f"key tidak didapat (insert {s4}: {str(k)[:120]})")
 
         rec["status"] = "success"
         rec["api_key"] = key
@@ -343,60 +358,249 @@ def cmd_check():
         print(f"  validate : ERR {e}")
     return 0
 
-
 def load_proxies(args):
-    """Isi _PROXY_LIST dari --proxy atau --proxy-file. None = direct."""
+    """Isi _PROXY_LIST dari --proxy / --proxy-file / proxies.txt / proxies_good.txt."""
     items = []
-    if args.proxy:
-        items.append(args.proxy)
-    if args.proxy_file:
-        try:
-            with open(args.proxy_file) as f:
+    if getattr(args, "proxy", None):
+        for seg in args.proxy.split():
+            items.append(seg)
+    src = getattr(args, "proxy_file", None) or getattr(args, "file", None)
+    if src:
+        if os.path.exists(src):
+            with open(src) as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith("#"):
                         items.append(line)
-        except FileNotFoundError:
-            print(f"✖ proxy file tidak ada: {args.proxy_file}")
+        else:
+            print(f"⚠ proxy file tidak ditemukan: {src}")
+    # fallback ke proxies.txt / proxies_good.txt bila ada di folder
+    if not items:
+        for defaut in (os.path.join(HERE, "proxies_good.txt"), os.path.join(HERE, "proxies.txt")):
+            if os.path.exists(defaut):
+                with open(defaut) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            items.append(line)
+                if items:
+                    print(f"  [proxies] memuat {len(items)} proxy dari {os.path.basename(defaut)}")
+                    break
     _PROXY_LIST[:] = items
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("count", nargs="?", type=int, default=None)
-    ap.add_argument("--check", action="store_true")
-    ap.add_argument("--sleep", type=float, default=0, help="jeda antar akun (detik)")
-    ap.add_argument("-w", "--workers", type=int, default=1, help="jumlah worker paralel")
-    ap.add_argument("--proxy", default=None, help="proxy tunggal, format user:pass@host:port atau host:port")
-    ap.add_argument("--proxy-file", default=None, help="file berisi daftar proxy (1 per baris), diputar round-robin")
-    ap.add_argument("--ref", default=REF_CODE)
-    args = ap.parse_args()
+def _is_too_many_signups(s, j):
+    """Deteksi gate 23514 / 429 — penanda proxy/IP kena cooldown -> trigger gacha reroll."""
+    return s in (429,) or (isinstance(j, dict) and "23514" in str(j))
 
-    if args.ref:
-        globals()["REF_CODE"] = args.ref
-    load_proxies(args)
 
-    if args.check:
-        return cmd_check()
+def farm_gacha(idx, max_roll=30):
+    """Satu akun dengan SEMUA request lewat proxy; farm_one() terpisah utk dahl. Di sini kita
+    modifikasi terpisah: mode gacha memanfaatkan _PROXY_LIST. farm_one() memakai
+    _PROXY_LIST thd rotasi. Tapi farm_one memakai _PROXY_LIST via round-robin. Untuk
+    'gacha' kita override acak. Kita simpel: pilih proxy acak satu per akun (random.choice)
+    DIPILIH admin--- kita ganti _PROXY_LIST scr random per akun + reroll bila 23514/429.
+    Di sini kita TIRU dahl: pilih random per akun; caller main 'gacha' set _PROXY_LIST=satu random,
+    kalau 23514 -> ganti random lain (reroll), ulangi max_roll kali."""
 
+
+def _run_filter(n):
+    """Jalankan filter_proxies.py untuk mengumpulkan proxy yang bisa akses target."""
+    fp = os.path.join(HERE, "filter_proxies.py")
+    if not os.path.exists(fp):
+        print("  ⚠ filter_proxies.py tidak ada (berada di folder yang sama dgn gonka_farm.py)")
+        return False
+    print(f"  [gacha] proxy kosong -> menjalankan filter_proxies.py (cari proxy yang bisa akses gonka)...")
+    import subprocess
+    try:
+        subprocess.run([sys.executable, fp, str(max(n * 3, 20))], cwd=HERE)
+    except Exception as e:
+        print(f"  [gacha] gagal jalankan filter: {e}")
+        return False
+    # muat ulang hasil
+    _PROXY_LIST[:] = []
+    pf = os.path.join(HERE, "proxies_good.txt")
+    if os.path.exists(pf):
+        with open(pf) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    _PROXY_LIST.append(line)
+    return len(_PROXY_LIST) > 0
+
+
+def _gacha_one(idx, max_roll, pool):
+    """Satu akun gacha: pilih proxy ACAK dari pool, reroll bila 23514/429.
+    Mengembalikan (sukses_bool, record). Thread-safe (pakai salinan pool lokal)."""
+    made, rolls = False, 0
+    r = {"status": "failed", "error": "no roll", "email": "", "proxy": ""}
+    while not made and rolls < max_roll:
+        rolls += 1
+        gacha_p = random.choice(pool)
+        masked = re.sub(r"://([^:@]+):[^@]+@", r"://\1:***@", gacha_p)
+        print(f"[{idx:03d}] Gacha Roll #{rolls}/{max_roll} -> {masked}", flush=True)
+        _set_forced_proxy(gacha_p)
+        r = farm_one(idx)
+        if r.get("status") == "success":
+            made = True
+            break
+        err = r.get("error", "")
+        if "23514" in err or "429" in err or "Too many signups" in err:
+            print(f"[{idx:03d}] 23514/429 -> gacha proxy lain ({err[:60]})", flush=True)
+            continue
+        made = True  # gagal non-rate-limit -> catat lalu lanjut
+    _set_forced_proxy(None)
+    if not made:
+        print(f"[{idx:03d}] GAGAL setelah {rolls} roll gacha: {r.get('error','')[:120]}", flush=True)
+    return (r.get("status") == "success", r)
+
+
+def cmd_gacha(args):
+    """Gacha: proxy ACAK per akun; reroll otomatis saat 23514/429."""
+    if not _PROXY_LIST:
+        print("proxies kosong — menjalankan filter proxy otomatis untuk gonka...")
+        if not _run_filter(args.count or 1):
+            print("  ✖ Tidak ada proxy yang bisa akses target. Jalankan: python filter_proxies.py 60")
+            return 1
     n = args.count or 1
-    print(f"GonkaAPI Farm | {n} akun | workers {args.workers} | "
-          f"proxy-file {len(_PROXY_LIST)} | ref {REF_CODE}")
+    pool = list(_PROXY_LIST)
+    workers = getattr(args, "workers", 1) or 1
+    print(f"\n== GACHA GONKA FARM: {n} akun | pool {len(pool)} proxy acak | "
+          f"workers {workers} | max-roll {args.max_roll} | ref {REF_CODE}")
     ok = 0
-    if args.workers > 1:
-        with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(farm_one, i): i for i in range(1, n + 1)}
-            for f in as_completed(futs):
-                if f.result().get("status") == "success":
-                    ok += 1
+
+    def run(i):
+        return _gacha_one(i, args.max_roll, pool)
+
+    if workers > 1:
+        # batching: workers akun paralel, TUNGGU batch selesai, baru lanjut
+        bs = getattr(args, "batch_sleep", 0) or 0
+        start = 1
+        while start <= n:
+            batch_idx = list(range(start, min(start + workers, n + 1)))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(run, i): i for i in batch_idx}
+                for f in as_completed(futs):
+                    okb, _ = f.result()
+                    if okb:
+                        ok += 1
+            if start + workers <= n:
+                if bs:
+                    print(f"  [gacha-batch] selesai {len(batch_idx)} akun, cooldown {bs}s...", flush=True)
+                    time.sleep(bs)
+            start += workers
     else:
         for i in range(1, n + 1):
-            r = farm_one(i)
-            if r["status"] == "success":
+            okb, _ = run(i)
+            if okb:
                 ok += 1
             if i < n and args.sleep:
                 time.sleep(args.sleep)
+
+    print(f"\n=== GACHA DONE: {ok}/{n} berhasil -> {OUT_KEYS} ===")
+    return 0
+
+
+def cmd_seq(args):
+    """Sequential farm memakai _PROXY_LIST (round-robin), tanpa parallel workers."""
+    n = args.count or 1
+    print(f"GonkaAPI Farm | {n} akun | sequential | "
+          f"proxy {len(_PROXY_LIST)} | ref {REF_CODE}")
+    ok = 0
+    for i in range(1, n + 1):
+        r = farm_one(i)
+        if r["status"] == "success":
+            ok += 1
+        if i < n and args.sleep:
+            time.sleep(args.sleep)
     print(f"\n=== {ok}/{n} berhasil -> {OUT_KEYS} ===")
+    return 0
+
+
+def cmd_batch(args):
+    """Farm paralel TERRBATCH: jalankan `workers` akun sekaligus, TUNGGU semuanya
+    selesai, baru lanjut batch berikutnya (`--batch-sleep` jeda antar batch)."""
+    n = args.count or 1
+    w = max(1, args.workers)
+    bs = getattr(args, "batch_sleep", 0) or 0
+    print(f"GonkaAPI Farm | {n} akun | batch {w} | "
+          f"batch-sleep {bs}s | proxy {len(_PROXY_LIST)} | ref {REF_CODE}")
+    if not _PROXY_LIST:
+        print("  ⚠ TANPA PROXY (direct IP). Anti-farm 23514/429 akan memblokir banyak akun. "
+              "Gunakan --proxy-file atau mode `gacha`.")
+    ok = 0
+    start = 1
+    while start <= n:
+        batch_idx = list(range(start, min(start + w, n + 1)))
+        with ThreadPoolExecutor(max_workers=w) as ex:
+            futs = {ex.submit(farm_one, i): i for i in batch_idx}
+            for f in as_completed(futs):
+                if f.result().get("status") == "success":
+                    ok += 1
+        # sebuah batch selesai (AWAIT penuh) baru lanjut
+        if start + w <= n:
+            if bs:
+                print(f"  [batch] selesai {len(batch_idx)} akun, cooldown {bs}s sebelum batch berikutnya...", flush=True)
+                time.sleep(bs)
+        start += w
+    print(f"\n=== {ok}/{n} berhasil -> {OUT_KEYS} ===")
+    return 0
+
+
+def main():
+    # Pre-process: dukung mode lama `gonka_farm.py 5 [opts]` (tanpa subcommand).
+    # Jika arg pertama bukan subcommand yang dikenal -> sisipkan 'farm' di depan.
+    known = {"farm", "gacha", "check"}
+    argv = list(sys.argv[1:])
+    if argv and argv[0] not in known:
+        argv = ["farm"] + argv
+
+    ap = argparse.ArgumentParser(prog="gonka_farm", description="GonkaAPI auto-farm (Supabase) — satu file")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("farm", help="sequential / batched farm (proxy round-robin / direct)")
+    p.add_argument("count", type=int, nargs="?", default=1)
+    p.add_argument("-w", "--workers", type=int, default=1)
+    p.add_argument("--sleep", type=float, default=0)
+    p.add_argument("--batch-sleep", type=float, default=0)
+    p.add_argument("--proxy", default=None)
+    p.add_argument("--proxy-file", default=None)
+    p.add_argument("--ref", default=None)
+
+    p = sub.add_parser("gacha", help="farm dgn proxy ACAK per akun + reroll otomatis saat 23514/429 (meniru dahl-farm)")
+    p.add_argument("count", type=int, nargs="?", default=1)
+    p.add_argument("-w", "--workers", type=int, default=1, help="jumlah worker paralel (batched)")
+    p.add_argument("--max-roll", type=int, default=30)
+    p.add_argument("--sleep", type=float, default=0)
+    p.add_argument("--batch-sleep", type=float, default=0)
+    p.add_argument("--proxy", default=None)
+    p.add_argument("--proxy-file", default=None)
+    p.add_argument("--ref", default=None)
+
+    p = sub.add_parser("check", help="cek konfig + akses Supabase")
+
+    args = ap.parse_args(argv)
+
+    if args.cmd == "gacha":
+        args.count = args.count or 1
+        if args.ref:
+            globals()["REF_CODE"] = args.ref
+        load_proxies(args)
+        return cmd_gacha(args)
+
+    if args.cmd == "farm":
+        n = args.count or 1
+        if args.ref:
+            globals()["REF_CODE"] = args.ref
+        load_proxies(args)
+        if args.workers > 1:
+            return cmd_batch(args)
+        return cmd_seq(args)
+
+    if args.cmd == "check":
+        return cmd_check()
+
+    # tak tercapai
     return 0
 
 

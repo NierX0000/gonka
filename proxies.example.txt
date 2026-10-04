@@ -1,0 +1,15 @@
+# Contoh isi proxies.txt / proxies_good.txt (1 proxy per baris).
+# Format didukung:
+#   user:pass@host:port
+#   http://user:pass@host:port
+#   https://user:pass@host:port
+#   socks5://user:pass@host:port
+#   host:port   (tanpa auth, mis. proxy lokal)
+#
+# Satu proxy tiap baris. Baris dimulai # diabaikan.
+#
+# Contoh:
+#brd-customer-hl_af7d432a-zone-noir:4pgimt1dl23c@brd.superproxy.io:44445
+#127.0.0.1:8888
+#user:pass@1.2.3.4:3128
+#socks5://user:pass@1.2.3.4:1080
